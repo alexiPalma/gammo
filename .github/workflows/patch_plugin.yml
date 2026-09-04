@@ -1,0 +1,185 @@
+name: Apply Telegram Gifts enhancements
+
+on:
+  push:
+    paths:
+      - '.github/workflows/patch_plugin.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch plugin
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('plugin_delite_gift.py')
+          s = p.read_text(encoding='utf-8')
+          marker = '# ============================================================\n# CARDINAL BINDS'
+          if 'TG_SURGICAL_EXTENSION_V1' in s:
+              raise SystemExit('extension already present')
+          ext = r'''
+
+# ============================================================
+# TG_SURGICAL_EXTENSION_V1
+# ============================================================
+# Дополнение к оригинальному плагину. Старая механика не изменяется.
+
+LOT_BIND_FILE = os.path.join(PLUGIN_DIR, "lots.json")
+TG_ADMIN_IDS = set()
+
+
+def _tg_load_lot_bindings():
+    os.makedirs(PLUGIN_DIR, exist_ok=True)
+    try:
+        with open(LOT_BIND_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _tg_save_lot_bindings(data):
+    os.makedirs(PLUGIN_DIR, exist_ok=True)
+    tmp = LOT_BIND_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+    os.replace(tmp, LOT_BIND_FILE)
+
+
+def _tg_extract_gift_id(text):
+    if not text:
+        return None
+    m = re.search(r"(?:^|\\s)ID\\s*:\\s*(\\d+)", str(text), re.I)
+    if not m:
+        return None
+    gid = int(m.group(1))
+    return gid if gid in GIFTS else None
+
+
+def _tg_order_candidates(obj):
+    out = []
+    for name in ("description", "full_description", "short_description", "title", "lot_title"):
+        try:
+            value = getattr(obj, name, None)
+        except Exception:
+            value = None
+        if value:
+            out.append(str(value))
+    return out
+
+
+def _tg_detect_gift(full_order, event_order):
+    bindings = _tg_load_lot_bindings()
+    lot_id = getattr(full_order, "lot_id", None) or getattr(event_order, "lot_id", None)
+    if lot_id is not None:
+        bound = bindings.get(str(lot_id))
+        if bound:
+            try:
+                gid = int(bound)
+                if gid in GIFTS:
+                    return gid, GIFTS[gid]
+            except Exception:
+                pass
+    for obj in (full_order, event_order):
+        for text in _tg_order_candidates(obj):
+            gid = _tg_extract_gift_id(text)
+            if gid is not None:
+                return gid, GIFTS[gid]
+    return find_gift(next(iter(_tg_order_candidates(full_order)), ""))
+
+
+_original_bind_to_new_order = bind_to_new_order
+
+
+def bind_to_new_order(c, e):
+    try:
+        full_order = c.account.get_order(e.order.id)
+    except Exception:
+        full_order = e.order
+    gift = _tg_detect_gift(full_order, e.order)
+    if gift:
+        original_find = globals().get("find_gift")
+        globals()["find_gift"] = lambda _title: gift
+        try:
+            return _original_bind_to_new_order(c, e)
+        finally:
+            globals()["find_gift"] = original_find
+    return _original_bind_to_new_order(c, e)
+
+
+def _tg_admin_id(msg):
+    try:
+        return int(msg.author_id)
+    except Exception:
+        return None
+
+
+def _tg_panel_message(c, chat_id, text):
+    send_funpay_message(chat_id, text)
+
+
+def _tg_run_async(coro):
+    if not _worker or not _worker.loop:
+        return None
+    return asyncio.run_coroutine_threadsafe(coro, _worker.loop)
+
+
+def _tg_panel(c, msg):
+    text = (getattr(msg, "text", "") or "").strip()
+    if not text.startswith("/gift_"):
+        return False
+    # Telegram-panel commands are accepted only from the Telegram account
+    # itself through the worker client. FunPay buyer messages are not treated
+    # as panel commands.
+    if not _worker:
+        return True
+    return False
+
+
+def _tg_account_text(result):
+    stars = getattr(result, "balance", None)
+    return "⭐ Telegram Gifts\n\nStars: " + (str(stars) if stars is not None else "не удалось получить")
+
+
+def _tg_handle_telegram_panel(c, msg):
+    if not _worker or not _worker.loop:
+        return False
+    return False
+
+
+def _tg_last_chat_message_hook(c, e):
+    # Compatibility hook for Cardinal versions exposing only
+    # LastChatMessageChangedEvent. The original NewMessageEvent remains active.
+    try:
+        chat = getattr(e, "chat", None)
+        if not chat or getattr(chat, "last_by_bot", False):
+            return
+        text = (getattr(chat, "last_message_text", "") or "").strip()
+        if not text:
+            return
+    except Exception:
+        return
+
+
+# Re-bind only the order hook so ID:<gift_id> in the full lot/order
+# description can override title matching. All original message mechanics
+# stay intact.
+BIND_TO_NEW_ORDER = [bind_to_new_order]
+'''
+          s = s.replace(marker, ext + '\n' + marker, 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+      - name: Commit patched plugin and remove workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add plugin_delite_gift.py
+          git rm .github/workflows/patch_plugin.yml
+          git commit -m 'feat: add surgical gift ID binding without replacing plugin'
+          git push
