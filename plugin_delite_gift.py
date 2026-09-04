@@ -1999,3 +1999,135 @@ BIND_TO_POST_STOP = [
 ]
 
 BIND_TO_DELETE = None
+
+# === COMPLETE FIXES ===
+import html, unicodedata
+LOT_BINDINGS_FILE=os.path.join(PLUGIN_DIR,'lot_bindings.json')
+try:
+    with open(LOT_BINDINGS_FILE,'r',encoding='utf-8') as f: LOT_BINDINGS=json.load(f)
+except Exception: LOT_BINDINGS={}
+
+def _clean(x): return unicodedata.normalize('NFKC',str(x or '')).replace('\u200b','').replace('\u200c','').replace('\u200d','').replace('\ufeff','').strip()
+def _refund(x): return _clean(x).casefold().replace(' ','')=='!возврат'
+def _plus(x): return _clean(x) in ('+','＋')
+def _gid(x):
+    m=re.search(r'(?i)\bID\s*:\s*(\d{10,25})\b',str(x or '')); return int(m.group(1)) if m else None
+def _lid(c,o):
+    for a in ('lot_id','offer_id'):
+        v=getattr(o,a,None)
+        if v is not None:return str(v)
+    try:
+        sub=getattr(o,'subcategory',None); lots=c.profile.get_sorted_lots(2).get(sub,{}) if sub else {}
+        text=str(getattr(o,'description','') or ''); best=None; n=-1
+        for l in lots.values():
+            q=', '.join(str(x) for x in (getattr(l,'server',None),getattr(l,'side',None),getattr(l,'description',None)) if x)
+            if q and q in text and len(q)>n:best,n=l,len(q)
+        return str(best.id) if best else None
+    except Exception:return None
+def _resolve(c,e,o):
+    for text in (getattr(o,'full_description',None),getattr(o,'description',None),getattr(o,'short_description',None),getattr(e.order,'description',None)):
+        gid=_gid(text)
+        if gid is not None:return gid,GIFTS.get(gid,'Подарок %s'%gid),_lid(c,o)
+    lid=_lid(c,o); b=LOT_BINDINGS.get(str(lid)) if lid else None
+    if b:
+        gid=int(b['gift_id']);return gid,GIFTS.get(gid,b.get('gift_name','Подарок %s'%gid)),lid
+    g=find_gift(getattr(o,'short_description',None) or getattr(o,'title',None) or getattr(o,'description',None) or '')
+    return (g[0],g[1],lid) if g else None
+def _save_bind():
+    os.makedirs(PLUGIN_DIR,exist_ok=True); tmp=LOT_BINDINGS_FILE+'.tmp'
+    with open(tmp,'w',encoding='utf-8') as f:json.dump(LOT_BINDINGS,f,ensure_ascii=False,indent=4)
+    os.replace(tmp,LOT_BINDINGS_FILE)
+def _new(c,e):
+    try:
+        oid=str(e.order.id)
+        if oid in _orders:return
+        o=c.account.get_order(e.order.id); r=_resolve(c,e,o)
+        if not r:return
+        gid,name,lid=r; chat=getattr(e.order,'chat_id',None) or getattr(o,'chat_id',None); buyer=getattr(o,'buyer_username',None) or getattr(e.order,'buyer_username',None) or ''
+        if not chat and buyer:
+            try:q=c.account.get_chat_by_name(buyer); chat=q.id if q else None
+            except Exception:pass
+        if not chat:return
+        with _orders_lock:_orders[oid]={'order_id':oid,'gift_id':gid,'gift_name':name,'lot_id':lid,'buyer':buyer,'buyer_id':getattr(o,'buyer_id',None),'chat_id':chat,'recipient':None,'status':STATUS_USERNAME,'last_error':None,'amount':max(1,int(getattr(o,'amount',1) or 1)),'created_at':time.time()}
+        save_orders();send_funpay_message(chat,'🎁 Спасибо за покупку!\n\nПодарок: «%s»\nКоличество: %s\n\nОтправьте ваш Telegram username, куда отправить подарок.\n\nПример: @username\n\n❗ Для отмены заказа отправьте: !возврат'%(name,_orders[oid]['amount']))
+    except Exception:logger.exception('Telegram Gifts: fixed new order')
+def _find(m):
+    oid,o=find_order_by_chat(getattr(m,'chat_id',None))
+    if o:return oid,o
+    a=str(getattr(m,'author','') or '').lstrip('@').casefold()
+    with _orders_lock:
+        for i,v in _orders.items():
+            if v.get('status') in (STATUS_USERNAME,STATUS_CONFIRM,STATUS_SENDING,STATUS_ERROR) and a and str(v.get('buyer','')).lstrip('@').casefold()==a:return i,v
+    return None,None
+def _msg(c,e):
+    try:
+        m=e.message;t=_clean(getattr(m,'text','') or ''); oid,o=_find(m)
+        if not t or not o:return
+        aid=getattr(m,'author_id',None)
+        if aid is not None and str(aid)==str(c.account.id):return
+        if aid is not None and o.get('buyer_id') is not None and str(aid)!=str(o['buyer_id']):return
+        cid=getattr(m,'chat_id',None) or o['chat_id']; st=o['status']
+        if _refund(t):
+            if st in (STATUS_USERNAME,STATUS_CONFIRM,STATUS_ERROR):refund_order(oid)
+            else:send_funpay_message(cid,'⏳ Подарок уже отправляется. Дождитесь результата текущей попытки.')
+            return
+        if st==STATUS_USERNAME:
+            u=normalize_username(t)
+            if not u:send_funpay_message(cid,'❌ Некорректный username. Отправьте @username или !возврат');return
+            update_order(oid,recipient=u,status=STATUS_CONFIRM,last_error=None);send_funpay_message(cid,'📋 Получатель: %s\n\nЕсли всё верно — отправьте «+».\nДля изменения отправьте новый username.\nДля возврата: !возврат'%u);return
+        if st==STATUS_CONFIRM and _plus(t):
+            update_order(oid,status=STATUS_SENDING,last_error=None);send_funpay_message(cid,'⏳ Отправляю подарок...')
+            if _worker:_worker.submit(oid)
+            return
+        if st==STATUS_CONFIRM:
+            u=normalize_username(t)
+            if u:update_order(oid,recipient=u,status=STATUS_CONFIRM,last_error=None);send_funpay_message(cid,'📋 Получатель изменён: %s\n\nОтправьте «+». '%u);return
+        if st==STATUS_ERROR and _plus(t) and o.get('recipient'):
+            update_order(oid,status=STATUS_SENDING,last_error=None);send_funpay_message(cid,'⏳ Повторяю отправку подарка...')
+            if _worker:_worker.submit(oid)
+    except Exception:logger.exception('Telegram Gifts: fixed message')
+async def _stars(self):
+    from telethon.tl.functions.payments import GetStarsStatusRequest
+    from telethon.tl.types import InputPeerSelf
+    return await self.client(GetStarsStatusRequest(peer=InputPeerSelf()))
+async def _info(self):
+    await self._ensure_client();me=await self.client.get_me();s=await self._stars();b=getattr(getattr(s,'balance',None),'amount',0) or 0
+    n=' '.join(x for x in (getattr(me,'first_name',None),getattr(me,'last_name',None)) if x) or '—';u='@'+me.username if getattr(me,'username',None) else 'нет username'
+    return '🎁 <b>Telegram Gifts — аккаунт</b>\n\n👤 Имя: <code>%s</code>\n🔗 Username: <code>%s</code>\n🆔 ID: <code>%s</code>\n⭐ Stars: <b>%s</b>'%(html.escape(n),html.escape(u),me.id,int(b))
+def _commands(c):
+    if not getattr(c,'telegram',None):return
+    tg=c.telegram
+    c.add_telegram_commands(UUID,[('gift_account','Telegram-аккаунт и баланс Stars',True),('gift_lots','Привязанные лоты',True),('gift_bind','Привязать: /gift_bind LOT_ID GIFT_ID',False),('gift_unbind','Отвязать: /gift_unbind LOT_ID',False)])
+    def ok(m):
+        try:return m.from_user.id in tg.authorized_users
+        except:return False
+    def account(m):
+        if not ok(m) or not _worker:return
+        try:tg.bot.send_message(m.chat.id,_worker.run_coro(_worker.info()).result(timeout=45))
+        except Exception as ex:tg.bot.send_message(m.chat.id,'❌ Ошибка: <code>%s</code>'%html.escape(str(ex)))
+    def lots(m):
+        if not ok(m):return
+        if not LOT_BINDINGS:tg.bot.send_message(m.chat.id,'📦 Привязанных лотов нет.');return
+        tg.bot.send_message(m.chat.id,'📦 <b>Привязанные лоты</b>\n\n'+'\n'.join('• <code>%s</code> → «%s» (<code>%s</code>)'%(k,html.escape(str(v.get('gift_name') or GIFTS.get(int(v['gift_id']),v['gift_id']))),v.get('gift_id')) for k,v in sorted(LOT_BINDINGS.items())))
+    def bind(m):
+        if not ok(m):return
+        x=_clean(m.text).split()
+        if len(x)!=3 or not x[1].isdigit() or not x[2].isdigit():tg.bot.send_message(m.chat.id,'Использование: <code>/gift_bind LOT_ID GIFT_ID</code>');return
+        gid=int(x[2])
+        if gid not in GIFTS:tg.bot.send_message(m.chat.id,'❌ Неизвестный gift_id.');return
+        LOT_BINDINGS[x[1]]={'gift_id':gid,'gift_name':GIFTS[gid]};_save_bind();tg.bot.send_message(m.chat.id,'✅ Лот привязан.')
+    def unbind(m):
+        if not ok(m):return
+        x=_clean(m.text).split()
+        if len(x)!=2 or not x[1].isdigit():tg.bot.send_message(m.chat.id,'Использование: <code>/gift_unbind LOT_ID</code>');return
+        old=LOT_BINDINGS.pop(x[1],None);_save_bind();tg.bot.send_message(m.chat.id,'✅ Лот отвязан.' if old else 'ℹ️ Привязка не найдена.')
+    tg.msg_handler(account,commands=['gift_account']);tg.msg_handler(lots,commands=['gift_lots']);tg.msg_handler(bind,commands=['gift_bind']);tg.msg_handler(unbind,commands=['gift_unbind'])
+TelegramGiftWorker.run_coro=lambda self,coro: asyncio.run_coroutine_threadsafe(coro,self.loop)
+TelegramGiftWorker.stars=stars_fixed if 'stars_fixed' in globals() else _stars
+TelegramGiftWorker.info=_info
+_old_init=post_init
+def post_init_fixed(c): _old_init(c);_commands(c)
+BIND_TO_POST_INIT=[post_init_fixed]
+BIND_TO_NEW_ORDER=[_new]
+BIND_TO_NEW_MESSAGE=[_msg]
+VERSION='2.0.1'
