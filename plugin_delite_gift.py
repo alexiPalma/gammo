@@ -1,30 +1,23 @@
 # -*- coding: utf-8 -*-
+"""Telegram Gifts for FunPay Cardinal.
 
-"""
-Telegram Gifts for FunPay Cardinal
-----------------------------------
+Полноценный плагин автоматической выдачи Telegram-подарков.
 
-Автоматическая выдача Telegram-подарков после покупки лота FunPay.
+Главный принцип выбора подарка:
+1. Явная привязка LOT_ID -> GIFT_ID из lot_bindings.json.
+2. ID:... в ПОЛНОМ описании самого лота FunPay.
+3. Только как запасной вариант — название лота.
 
-Сценарий:
-
-1. Покупатель покупает лот.
-2. Плагин определяет подарок по названию лота.
-3. Плагин просит Telegram username.
-4. Покупатель отправляет @username.
-5. Плагин показывает получателя и ждёт "+".
-6. После "+" подарок отправляется через Telegram MTProto.
-7. Только после успешного ответа Telegram заказ считается выданным.
-8. При ошибке заказ НЕ считается выполненным.
-9. Доступен !возврат.
-10. Состояние заказов сохраняется в JSON.
-11. Telethon подключается лениво, чтобы отсутствие зависимости
-    не мешало загрузке самого плагина Cardinal.
+Это важно: название заказа больше не имеет приоритета над привязкой.
+Поэтому лот "Мишка романтика" не сможет случайно получить ID другого подарка,
+если у него есть правильная привязка.
 """
 
 from __future__ import annotations
 
 import asyncio
+import html
+import importlib.util
 import json
 import logging
 import os
@@ -33,9 +26,8 @@ import subprocess
 import sys
 import threading
 import time
-import importlib.util
+import unicodedata
 
-from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent
 from FunPayAPI.types import MessageTypes
 
 
@@ -44,18 +36,11 @@ from FunPayAPI.types import MessageTypes
 # ============================================================
 
 NAME = "Telegram Gifts"
-VERSION = "1.1.0"
+VERSION = "2.1.0"
 DESCRIPTION = "Автоматическая выдача Telegram-подарков после покупки на FunPay."
 CREDITS = "@podarckov"
-
-# ВАЖНО:
-# Это настоящий UUID4.
 UUID = "7f8e2d91-4b36-4c2a-9f15-6a7d83e4b102"
-
-# Обязательное поле Cardinal.
 SETTINGS_PAGE = False
-
-# Обязательное поле Cardinal.
 BIND_TO_DELETE = None
 
 
@@ -65,104 +50,8 @@ BIND_TO_DELETE = None
 
 API_ID = 32493973
 API_HASH = "e470a990253e9502835f62cc5958aed7"
-
 SESSION_NAME = "telegram_gifts"
-
-
-# ============================================================
-# TELEGRAM DEPENDENCY
-# ============================================================
-
-TELETHON_PACKAGE = "telethon"
-
-_telethon_install_lock = threading.Lock()
-
-
-def ensure_telethon():
-    """
-    Проверяет наличие Telethon.
-
-    Если Telethon отсутствует, пытается установить его через pip.
-
-    Это специально выполняется НЕ при импорте плагина.
-    Благодаря этому отсутствие Telethon не мешает Cardinal
-    обнаружить сам плагин.
-    """
-
-    if importlib.util.find_spec("telethon") is not None:
-        return True
-
-    with _telethon_install_lock:
-
-        if importlib.util.find_spec("telethon") is not None:
-            return True
-
-        logger.warning(
-            "Telegram Gifts: Telethon не найден. "
-            "Устанавливаю зависимость..."
-        )
-
-        try:
-
-            subprocess.check_call(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "telethon>=1.36,<2"
-                ]
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Telegram Gifts: не удалось установить Telethon."
-            )
-
-            return False
-
-    return importlib.util.find_spec("telethon") is not None
-
-
-# ============================================================
-# PATHS
-# ============================================================
-
-PLUGIN_DIR = os.path.join(
-    "storage",
-    "plugins",
-    UUID
-)
-
-ORDERS_FILE = os.path.join(
-    PLUGIN_DIR,
-    "orders.json"
-)
-
-SESSION_FILE = os.path.join(
-    PLUGIN_DIR,
-    SESSION_NAME
-)
-
-
-# ============================================================
-# LOGGER
-# ============================================================
-
-logger = logging.getLogger("telegram_gifts")
-
-
-# ============================================================
-# ORDER STATUSES
-# ============================================================
-
-STATUS_USERNAME = "await_username"
-STATUS_CONFIRM = "await_confirm"
-STATUS_SENDING = "sending"
-STATUS_DELIVERED = "delivered"
-STATUS_REFUNDED = "refunded"
-STATUS_ERROR = "error"
+TELETHON_PACKAGE = "telethon>=1.36,<2"
 
 
 # ============================================================
@@ -182,341 +71,393 @@ GIFTS = {
     6046178578163303744: "Мишка-террорист",
 }
 
-
-# ============================================================
-# GIFT MESSAGE
-# ============================================================
-
 GIFT_MESSAGE = ""
 
 
 # ============================================================
-# GLOBAL STATE
+# PATHS / LOGGER
 # ============================================================
 
-_cardinal = None
+logger = logging.getLogger("telegram_gifts")
+
+PLUGIN_DIR = os.path.join("storage", "plugins", UUID)
+ORDERS_FILE = os.path.join(PLUGIN_DIR, "orders.json")
+LOT_BINDINGS_FILE = os.path.join(PLUGIN_DIR, "lot_bindings.json")
+SESSION_FILE = os.path.join(PLUGIN_DIR, SESSION_NAME)
 
 _orders_lock = threading.RLock()
-
-_orders = {}
-
+_telethon_install_lock = threading.Lock()
+_orders: dict[str, dict] = {}
+_lot_bindings: dict[str, dict] = {}
+_cardinal = None
 _worker = None
 
 
 # ============================================================
-# STATE
+# STATUSES
 # ============================================================
 
-def load_orders():
-    global _orders
+STATUS_USERNAME = "await_username"
+STATUS_CONFIRM = "await_confirm"
+STATUS_SENDING = "sending"
+STATUS_DELIVERED = "delivered"
+STATUS_REFUNDED = "refunded"
+STATUS_ERROR = "error"
 
-    os.makedirs(
-        PLUGIN_DIR,
-        exist_ok=True
-    )
+ACTIVE_STATUSES = (
+    STATUS_USERNAME,
+    STATUS_CONFIRM,
+    STATUS_SENDING,
+    STATUS_ERROR,
+)
 
-    if not os.path.exists(ORDERS_FILE):
-        _orders = {}
-        return
 
+# ============================================================
+# DEPENDENCY
+# ============================================================
+
+def ensure_telethon() -> bool:
+    if importlib.util.find_spec("telethon") is not None:
+        return True
+
+    with _telethon_install_lock:
+        if importlib.util.find_spec("telethon") is not None:
+            return True
+        logger.warning("Telegram Gifts: Telethon не найден, устанавливаю зависимость...")
+        try:
+            subprocess.check_call([
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                TElethon_PACKAGE if False else TELETHON_PACKAGE,
+            ])
+        except Exception:
+            logger.exception("Telegram Gifts: не удалось установить Telethon")
+            return False
+
+    return importlib.util.find_spec("telethon") is not None
+
+
+# ============================================================
+# JSON STATE
+# ============================================================
+
+def _load_json(path: str, default):
+    os.makedirs(PLUGIN_DIR, exist_ok=True)
+    if not os.path.exists(path):
+        return default
     try:
-
-        with open(
-            ORDERS_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
-
-            data = json.load(file)
-
-        if isinstance(data, dict):
-            _orders = data
-        else:
-            _orders = {}
-
-        logger.info(
-            "Telegram Gifts: загружено заказов: %s",
-            len(_orders)
-        )
-
+        with open(path, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return value
     except Exception:
-
-        logger.exception(
-            "Telegram Gifts: ошибка загрузки orders.json"
-        )
-
-        _orders = {}
+        logger.exception("Telegram Gifts: ошибка чтения %s", path)
+        return default
 
 
-def save_orders():
+def _save_json(path: str, value) -> None:
+    os.makedirs(PLUGIN_DIR, exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(value, f, ensure_ascii=False, indent=4)
+        os.replace(tmp, path)
+    except Exception:
+        logger.exception("Telegram Gifts: ошибка сохранения %s", path)
 
-    os.makedirs(
-        PLUGIN_DIR,
-        exist_ok=True
-    )
 
-    temporary = ORDERS_FILE + ".tmp"
+def load_state() -> None:
+    global _orders, _lot_bindings
+    with _orders_lock:
+        orders = _load_json(ORDERS_FILE, {})
+        bindings = _load_json(LOT_BINDINGS_FILE, {})
+        _orders = orders if isinstance(orders, dict) else {}
+        _lot_bindings = bindings if isinstance(bindings, dict) else {}
+    logger.info("Telegram Gifts: загружено заказов: %s, привязок лотов: %s", len(_orders), len(_lot_bindings))
 
+
+def save_orders() -> None:
     with _orders_lock:
         data = dict(_orders)
-
-    try:
-
-        with open(
-            temporary,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                data,
-                file,
-                ensure_ascii=False,
-                indent=4
-            )
-
-        os.replace(
-            temporary,
-            ORDERS_FILE
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Telegram Gifts: ошибка сохранения orders.json"
-        )
+    _save_json(ORDERS_FILE, data)
 
 
-def update_order(
-    order_id,
-    **kwargs
-):
-
-    order_id = str(order_id)
-
+def save_bindings() -> None:
     with _orders_lock:
+        data = dict(_lot_bindings)
+    _save_json(LOT_BINDINGS_FILE, data)
 
-        if order_id not in _orders:
+
+def update_order(order_id, **kwargs) -> None:
+    oid = str(order_id)
+    with _orders_lock:
+        if oid not in _orders:
             return
-
-        _orders[order_id].update(
-            kwargs
-        )
-
+        _orders[oid].update(kwargs)
     save_orders()
 
 
 # ============================================================
-# FUNPAY MESSAGE
+# TEXT / INPUT HELPERS
 # ============================================================
 
-def send_funpay_message(
-    chat_id,
-    text
-):
+def clean_text(value) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "").strip()
 
-    if _cardinal is None:
-        return
 
+def normalize_text(value) -> str:
+    return clean_text(value).casefold().replace("ё", "е")
+
+
+def is_refund_command(value) -> bool:
+    return clean_text(value).casefold().replace(" ", "") == "!возврат"
+
+
+def is_plus(value) -> bool:
+    return clean_text(value) in ("+", "＋")
+
+
+USERNAME_RE = re.compile(r"^@?[A-Za-z0-9_]{5,32}$")
+ID_RE = re.compile(r"(?i)\bID\s*:\s*(\d{10,25})\b")
+
+
+def normalize_username(value):
+    text = clean_text(value)
+    if not USERNAME_RE.fullmatch(text):
+        return None
+    return text if text.startswith("@") else "@" + text
+
+
+def extract_gift_id(value):
+    match = ID_RE.search(str(value or ""))
+    if not match:
+        return None
     try:
-
-        _cardinal.send_message(
-            chat_id,
-            text
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Telegram Gifts: не удалось отправить сообщение "
-            "в FunPay chat=%s",
-            chat_id
-        )
-
-
-# ============================================================
-# TEXT HELPERS
-# ============================================================
-
-def normalize_text(text):
-
-    if not text:
-        return ""
-
-    return (
-        str(text)
-        .strip()
-        .lower()
-        .replace("ё", "е")
-    )
-
-
-def find_gift(
-    lot_title
-):
-
-    normalized_lot = normalize_text(
-        lot_title
-    )
-
-    if not normalized_lot:
+        return int(match.group(1))
+    except ValueError:
         return None
 
-    # Сначала точное совпадение.
-    for gift_id, gift_name in GIFTS.items():
 
-        if normalized_lot == normalize_text(
-            gift_name
-        ):
+def gift_name(gift_id) -> str:
+    gid = int(gift_id)
+    return GIFTS.get(gid, f"Подарок {gid}")
 
-            return (
-                int(gift_id),
-                gift_name
-            )
 
-    # Потом частичное.
-    for gift_id, gift_name in GIFTS.items():
+def find_gift_by_name(value):
+    text = normalize_text(value)
+    if not text:
+        return None
+    for gid, name in GIFTS.items():
+        if text == normalize_text(name):
+            return gid, name
+    for gid, name in GIFTS.items():
+        if normalize_text(name) in text:
+            return gid, name
+    return None
 
-        normalized_name = normalize_text(
-            gift_name
-        )
 
-        if normalized_name in normalized_lot:
+# ============================================================
+# FUNPAY HELPERS
+# ============================================================
 
-            return (
-                int(gift_id),
-                gift_name
-            )
+def send_funpay_message(chat_id, text) -> bool:
+    if _cardinal is None or chat_id is None:
+        return False
+    try:
+        _cardinal.send_message(chat_id, text)
+        return True
+    except Exception:
+        logger.exception("Telegram Gifts: не удалось отправить сообщение в FunPay chat=%s", chat_id)
+        return False
+
+
+def get_full_order(c, event):
+    try:
+        return c.account.get_order(event.order.id)
+    except Exception:
+        logger.debug("Telegram Gifts: get_order не сработал", exc_info=True)
+        return event.order
+
+
+def find_order_lot(c, event, order):
+    """Определяет реальный LOT_ID через профиль, а не через текст покупателя."""
+    direct = getattr(order, "lot_id", None)
+    if direct is not None:
+        return str(direct)
+
+    direct = getattr(event.order, "lot_id", None)
+    if direct is not None:
+        return str(direct)
+
+    subcategory = getattr(event.order, "subcategory", None) or getattr(order, "subcategory", None)
+    if subcategory is None:
+        return None
+
+    description = clean_text(getattr(event.order, "description", None) or "")
+    if not description:
+        return None
+
+    try:
+        grouped = c.profile.get_sorted_lots(2)
+        lots = grouped.get(subcategory, {})
+        candidates = []
+        for lot in lots.values():
+            parts = [
+                clean_text(getattr(lot, "server", None)),
+                clean_text(getattr(lot, "side", None)),
+                clean_text(getattr(lot, "description", None)),
+            ]
+            signature = ", ".join(x for x in parts if x)
+            if signature and signature in description:
+                candidates.append((len(signature), lot))
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            return str(candidates[0][1].id)
+    except Exception:
+        logger.exception("Telegram Gifts: не удалось определить LOT_ID по профилю")
+    return None
+
+
+def fetch_lot_description(c, lot_id):
+    """Читает настоящее подробное описание лота FunPay."""
+    if lot_id is None:
+        return ""
+
+    try:
+        page = c.account.get_lot_page(int(lot_id))
+        if page:
+            text = getattr(page, "full_description", None)
+            if text:
+                return clean_text(text)
+    except Exception:
+        logger.debug("Telegram Gifts: get_lot_page(%s) не сработал", lot_id, exc_info=True)
+
+    try:
+        fields = c.account.get_lot_fields(int(lot_id))
+        for attr in ("description_ru", "description_en", "description"):
+            text = getattr(fields, attr, None)
+            if text:
+                return clean_text(text)
+    except Exception:
+        logger.debug("Telegram Gifts: get_lot_fields(%s) не сработал", lot_id, exc_info=True)
+
+    return ""
+
+
+def resolve_gift(c, event, order):
+    """Возвращает (gift_id, gift_name, lot_id, source)."""
+    lot_id = find_order_lot(c, event, order)
+
+    # 1. Явная привязка — самый высокий приоритет.
+    if lot_id is not None:
+        with _orders_lock:
+            binding = _lot_bindings.get(str(lot_id))
+        if isinstance(binding, dict) and binding.get("gift_id") is not None:
+            gid = int(binding["gift_id"])
+            return gid, gift_name(gid), str(lot_id), "binding"
+
+    # 2. ID в подробном описании реального лота.
+    detailed = fetch_lot_description(c, lot_id)
+    gid = extract_gift_id(detailed)
+    if gid is not None:
+        return gid, gift_name(gid), lot_id, "description"
+
+    # 3. ID в данных заказа — запасной вариант.
+    for text in (
+        getattr(order, "full_description", None),
+        getattr(order, "description", None),
+        getattr(order, "short_description", None),
+        getattr(event.order, "description", None),
+    ):
+        gid = extract_gift_id(text)
+        if gid is not None:
+            return gid, gift_name(gid), lot_id, "order_description"
+
+    # 4. Название — только fallback.
+    for text in (
+        getattr(order, "short_description", None),
+        getattr(order, "title", None),
+        getattr(event.order, "description", None),
+    ):
+        found = find_gift_by_name(text)
+        if found:
+            return found[0], found[1], lot_id, "name_fallback"
 
     return None
 
 
 # ============================================================
-# USERNAME
+# ORDER LOOKUP
 # ============================================================
 
-USERNAME_RE = re.compile(
-    r"^@?[A-Za-z0-9_]{5,32}$"
-)
-
-
-def normalize_username(
-    text
-):
-
-    if not text:
-        return None
-
-    text = text.strip()
-
-    if not USERNAME_RE.fullmatch(
-        text
-    ):
-        return None
-
-    if not text.startswith("@"):
-        text = "@" + text
-
-    return text
-
-
-# ============================================================
-# ACTIVE ORDER
-# ============================================================
-
-def find_order_by_chat(
-    chat_id
-):
-
-    chat_id = str(chat_id)
+def find_order_by_message(msg):
+    chat_id = getattr(msg, "chat_id", None)
+    author_id = getattr(msg, "author_id", None)
+    author = clean_text(getattr(msg, "author", None)).lstrip("@").casefold()
 
     with _orders_lock:
+        if chat_id is not None:
+            candidates = [
+                (oid, order)
+                for oid, order in _orders.items()
+                if str(order.get("chat_id")) == str(chat_id)
+                and order.get("status") in ACTIVE_STATUSES
+            ]
+            if candidates:
+                # Самый свежий заказ в чате.
+                candidates.sort(key=lambda x: float(x[1].get("created_at", 0)), reverse=True)
+                return candidates[0]
 
-        # Сначала активные.
-        for order_id, order in _orders.items():
+        # Запасной вариант для Cardinal-конфигураций, где chat_id события отсутствует.
+        if author:
+            for oid, order in sorted(_orders.items(), key=lambda x: float(x[1].get("created_at", 0)), reverse=True):
+                if order.get("status") not in ACTIVE_STATUSES:
+                    continue
+                buyer = clean_text(order.get("buyer", "")).lstrip("@").casefold()
+                if buyer and buyer == author:
+                    return oid, order
 
-            if (
-                str(order.get("chat_id")) == chat_id
-                and order.get("status") in (
-                    STATUS_USERNAME,
-                    STATUS_CONFIRM,
-                    STATUS_SENDING,
-                    STATUS_ERROR
-                )
-            ):
+        # Если есть author_id, не позволяем другому пользователю управлять заказом.
+        if author_id is not None:
+            for oid, order in _orders.items():
+                if order.get("status") in ACTIVE_STATUSES and order.get("buyer_id") is not None:
+                    if str(order.get("buyer_id")) == str(author_id):
+                        return oid, order
 
-                return (
-                    order_id,
-                    order
-                )
-
-    return (
-        None,
-        None
-    )
+    return None, None
 
 
 # ============================================================
 # REFUND
 # ============================================================
 
-def refund_order(
-    order_id
-):
-
-    order_id = str(order_id)
-
+def refund_order(order_id) -> bool:
+    oid = str(order_id)
     with _orders_lock:
-        order = _orders.get(
-            order_id
-        )
-
+        order = _orders.get(oid)
     if not order:
-        return
+        return False
 
-    if order.get("status") == STATUS_REFUNDED:
-        return
+    status = order.get("status")
+    if status in (STATUS_DELIVERED, STATUS_REFUNDED, STATUS_SENDING):
+        if status == STATUS_DELIVERED:
+            send_funpay_message(order.get("chat_id"), "ℹ️ Подарок уже был успешно отправлен. Возврат через !возврат после выдачи недоступен.")
+        elif status == STATUS_SENDING:
+            send_funpay_message(order.get("chat_id"), "⏳ Подарок уже отправляется. Дождитесь результата текущей попытки.")
+        return False
 
     try:
-
-        _cardinal.account.refund(
-            order_id
-        )
-
-        update_order(
-            order_id,
-            status=STATUS_REFUNDED,
-            last_error=None
-        )
-
-        send_funpay_message(
-            order["chat_id"],
-            "❌ Заказ отменён.\n\n"
-            "Средства возвращены."
-        )
-
-        logger.info(
-            "Telegram Gifts: заказ возвращён: %s",
-            order_id
-        )
-
+        _cardinal.account.refund(oid)
+        update_order(oid, status=STATUS_REFUNDED, last_error=None, refunded_at=time.time())
+        send_funpay_message(order.get("chat_id"), "❌ Заказ отменён.\n\nСредства возвращены.")
+        logger.info("Telegram Gifts: возврат выполнен order=%s", oid)
+        return True
     except Exception as exc:
-
-        logger.exception(
-            "Telegram Gifts: ошибка возврата order=%s",
-            order_id
-        )
-
-        update_order(
-            order_id,
-            last_error=str(exc)
-        )
-
-        send_funpay_message(
-            order["chat_id"],
-            "⚠️ Не удалось автоматически оформить возврат.\n\n"
-            "Продавец обработает возврат вручную."
-        )
+        logger.exception("Telegram Gifts: ошибка возврата order=%s", oid)
+        update_order(oid, last_error=str(exc))
+        send_funpay_message(order.get("chat_id"), "⚠️ Не удалось автоматически оформить возврат.\n\nПродавец обработает возврат вручную.")
+        return False
 
 
 # ============================================================
@@ -524,1610 +465,565 @@ def refund_order(
 # ============================================================
 
 class TelegramGiftWorker:
-
-    def __init__(
-        self,
-        cardinal
-    ):
-
+    def __init__(self, cardinal):
         self.cardinal = cardinal
-
         self.loop = None
         self.thread = None
         self.queue = None
-
         self.client = None
-
         self.ready = threading.Event()
         self.stop_event = threading.Event()
-
         self.telethon_available = False
 
-    # --------------------------------------------------------
-    # START
-    # --------------------------------------------------------
-
     def start(self):
-
-        if (
-            self.thread
-            and self.thread.is_alive()
-        ):
+        if self.thread and self.thread.is_alive():
             return
-
-        self.thread = threading.Thread(
-            target=self._thread_main,
-            name="TelegramGiftWorker",
-            daemon=True
-        )
-
+        self.thread = threading.Thread(target=self._thread_main, name="TelegramGiftWorker", daemon=True)
         self.thread.start()
-
-        self.ready.wait(
-            timeout=10
-        )
-
-    # --------------------------------------------------------
-    # THREAD
-    # --------------------------------------------------------
+        self.ready.wait(timeout=10)
 
     def _thread_main(self):
-
         self.loop = asyncio.new_event_loop()
-
-        asyncio.set_event_loop(
-            self.loop
-        )
-
+        asyncio.set_event_loop(self.loop)
         self.queue = asyncio.Queue()
-
         self.ready.set()
-
         try:
-
-            self.loop.run_until_complete(
-                self._worker_loop()
-            )
-
+            self.loop.run_until_complete(self._worker_loop())
         except Exception:
-
-            logger.exception(
-                "Telegram Gifts: критическая ошибка worker"
-            )
-
+            logger.exception("Telegram Gifts: критическая ошибка worker")
         finally:
-
             try:
-
-                self.loop.run_until_complete(
-                    self._disconnect()
-                )
-
+                self.loop.run_until_complete(self._disconnect())
             except Exception:
                 pass
-
             try:
                 self.loop.close()
             except Exception:
                 pass
 
-    # --------------------------------------------------------
-    # QUEUE
-    # --------------------------------------------------------
-
     async def _worker_loop(self):
-
         while not self.stop_event.is_set():
-
             try:
-
-                job = await asyncio.wait_for(
-                    self.queue.get(),
-                    timeout=1
-                )
-
+                job = await asyncio.wait_for(self.queue.get(), timeout=1)
             except asyncio.TimeoutError:
                 continue
-
             try:
-
-                await self._process_job(
-                    job
-                )
-
+                await self._process_job(job)
             except Exception:
+                logger.exception("Telegram Gifts: ошибка обработки job")
 
-                logger.exception(
-                    "Telegram Gifts: ошибка обработки job"
-                )
-
-    # --------------------------------------------------------
-    # PROCESS
-    # --------------------------------------------------------
-
-    async def _process_job(
-        self,
-        job
-    ):
-
-        order_id = str(
-            job["order_id"]
-        )
-
+    async def _process_job(self, job):
+        oid = str(job["order_id"])
         with _orders_lock:
-            order = _orders.get(
-                order_id
-            )
-
-        if not order:
-
-            logger.error(
-                "Telegram Gifts: заказ %s отсутствует",
-                order_id
-            )
-
+            order = dict(_orders.get(oid, {}))
+        if not order or order.get("status") != STATUS_SENDING:
             return
 
-        if order.get("status") == STATUS_DELIVERED:
-            return
-
-        if order.get("status") != STATUS_SENDING:
-            return
-
-        recipient = order.get(
-            "recipient"
-        )
-
-        gift_id = order.get(
-            "gift_id"
-        )
-
-        gift_name = order.get(
-            "gift_name"
-        )
-
-        # ----------------------------------------------------
-        # CLIENT
-        # ----------------------------------------------------
+        recipient = order.get("recipient")
+        gift_id = int(order.get("gift_id"))
+        gift_name_value = order.get("gift_name") or gift_name(gift_id)
 
         try:
-
             await self._ensure_client()
-
         except Exception as exc:
-
-            logger.exception(
-                "Telegram Gifts: не удалось запустить Telegram"
-            )
-
-            update_order(
-                order_id,
-                status=STATUS_ERROR,
-                last_error=str(exc)
-            )
-
-            send_funpay_message(
-                order["chat_id"],
-                "❌ Не удалось подключиться к Telegram.\n\n"
-                "Подарок не отправлен. "
-                "Заказ не считается выполненным."
-            )
-
+            logger.exception("Telegram Gifts: Telegram client недоступен")
+            update_order(oid, status=STATUS_ERROR, last_error=str(exc))
+            send_funpay_message(order.get("chat_id"), "❌ Не удалось подключиться к Telegram.\n\nПодарок не отправлен. Заказ не считается выполненным.")
             return
 
-        # ----------------------------------------------------
-        # ENTITY
-        # ----------------------------------------------------
-
         try:
-
-            user = await self.client.get_entity(
-                recipient
-            )
-
+            user = await self.client.get_entity(recipient)
+            input_peer = await self.client.get_input_entity(user)
         except Exception as exc:
-
-            error_text = str(
-                exc
-            )
-
-            logger.error(
-                "Telegram Gifts: пользователь %s не найден: %s",
-                recipient,
-                error_text
-            )
-
-            update_order(
-                order_id,
-                status=STATUS_USERNAME,
-                last_error=error_text
-            )
-
-            send_funpay_message(
-                order["chat_id"],
-                "❌ Не удалось найти Telegram-пользователя "
-                f"{recipient}.\n\n"
-                "Проверьте username и отправьте его ещё раз."
-            )
-
+            await self._handle_telegram_exception(oid, order, exc)
             return
 
-        # ----------------------------------------------------
-        # INPUT ENTITY
-        # ----------------------------------------------------
-
         try:
-
-            input_peer = await self.client.get_input_entity(
-                user
-            )
-
+            from telethon.tl.functions.payments import GetPaymentFormRequest, SendStarsFormRequest
+            from telethon.tl.types import InputInvoiceStarGift, TextWithEntities
         except Exception as exc:
-
-            logger.exception(
-                "Telegram Gifts: не удалось получить input entity"
-            )
-
-            update_order(
-                order_id,
-                status=STATUS_ERROR,
-                last_error=str(exc)
-            )
-
-            send_funpay_message(
-                order["chat_id"],
-                "❌ Не удалось определить получателя Telegram.\n\n"
-                "Подарок не отправлен."
-            )
-
+            logger.exception("Telegram Gifts: ошибка импорта Telethon API")
+            update_order(oid, status=STATUS_ERROR, last_error=str(exc))
+            send_funpay_message(order.get("chat_id"), "❌ Ошибка библиотеки Telegram.\n\nПодарок не отправлен.")
             return
 
-        # ----------------------------------------------------
-        # IMPORT TELETHON TYPES
-        # ----------------------------------------------------
+        message = TextWithEntities(text=GIFT_MESSAGE, entities=[]) if GIFT_MESSAGE else None
 
         try:
-
-            from telethon.tl.functions.payments import (
-                GetPaymentFormRequest,
-                SendStarsFormRequest,
-            )
-
-            from telethon.tl.types import (
-                InputInvoiceStarGift,
-                TextWithEntities,
-            )
-
-        except Exception as exc:
-
-            logger.exception(
-                "Telegram Gifts: ошибка импорта Telethon"
-            )
-
-            update_order(
-                order_id,
-                status=STATUS_ERROR,
-                last_error=str(exc)
-            )
-
-            send_funpay_message(
-                order["chat_id"],
-                "❌ Ошибка библиотеки Telegram.\n\n"
-                "Подарок не отправлен."
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # MESSAGE
-        # ----------------------------------------------------
-
-        message = None
-
-        if GIFT_MESSAGE:
-
-            message = TextWithEntities(
-                text=GIFT_MESSAGE,
-                entities=[]
-            )
-
-        # ----------------------------------------------------
-        # INVOICE
-        # ----------------------------------------------------
-
-        try:
-
             invoice = InputInvoiceStarGift(
                 peer=input_peer,
-                gift_id=int(gift_id),
-                message=message
+                gift_id=gift_id,
+                message=message,
             )
-
+            logger.info("Telegram Gifts: получаю payment form order=%s lot=%s gift=%s recipient=%s", oid, order.get("lot_id"), gift_id, recipient)
+            form = await self.client(GetPaymentFormRequest(invoice=invoice))
         except Exception as exc:
-
-            logger.exception(
-                "Telegram Gifts: не удалось создать invoice"
-            )
-
-            update_order(
-                order_id,
-                status=STATUS_ERROR,
-                last_error=str(exc)
-            )
-
-            send_funpay_message(
-                order["chat_id"],
-                "❌ Telegram не позволил создать запрос "
-                "на отправку подарка.\n\n"
-                "Подарок не отправлен."
-            )
-
+            await self._handle_telegram_exception(oid, order, exc)
             return
-
-        # ----------------------------------------------------
-        # PAYMENT FORM
-        # ----------------------------------------------------
 
         try:
-
-            logger.info(
-                "Telegram Gifts: получаю payment form "
-                "order=%s gift=%s recipient=%s",
-                order_id,
-                gift_id,
-                recipient
-            )
-
-            form = await self.client(
-                GetPaymentFormRequest(
-                    invoice=invoice
-                )
-            )
-
+            logger.info("Telegram Gifts: отправляю подарок order=%s gift=%s recipient=%s", oid, gift_id, recipient)
+            await self.client(SendStarsFormRequest(form_id=form.form_id, invoice=invoice))
         except Exception as exc:
-
-            await self._handle_telegram_exception(
-                order_id,
-                order,
-                exc
-            )
-
+            await self._handle_telegram_exception(oid, order, exc)
             return
 
-        # ----------------------------------------------------
-        # SEND
-        # ----------------------------------------------------
+        update_order(oid, status=STATUS_DELIVERED, last_error=None, delivered_at=time.time())
+        send_funpay_message(order.get("chat_id"), f"✅ Подарок «{gift_name_value}» успешно отправлен на {recipient}!\n\nСпасибо за покупку! Пожалуйста, подтвердите получение заказа и оставьте отзыв ❤️")
+        logger.info("Telegram Gifts: подарок успешно отправлен order=%s gift=%s", oid, gift_id)
 
-        try:
-
-            logger.info(
-                "Telegram Gifts: отправляю подарок "
-                "order=%s gift=%s recipient=%s",
-                order_id,
-                gift_id,
-                recipient
-            )
-
-            await self.client(
-                SendStarsFormRequest(
-                    form_id=form.form_id,
-                    invoice=invoice
-                )
-            )
-
-        except Exception as exc:
-
-            await self._handle_telegram_exception(
-                order_id,
-                order,
-                exc
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # SUCCESS
-        # ----------------------------------------------------
-
-        update_order(
-            order_id,
-            status=STATUS_DELIVERED,
-            last_error=None
-        )
-
-        send_funpay_message(
-            order["chat_id"],
-            "✅ Подарок "
-            f"«{gift_name}» успешно отправлен "
-            f"на {recipient}!\n\n"
-            "Спасибо за покупку! "
-            "Пожалуйста, подтвердите получение заказа "
-            "и оставьте отзыв ❤️"
-        )
-
-        logger.info(
-            "Telegram Gifts: подарок успешно отправлен "
-            "order=%s",
-            order_id
-        )
-
-    # --------------------------------------------------------
-    # TELEGRAM EXCEPTION
-    # --------------------------------------------------------
-
-    async def _handle_telegram_exception(
-        self,
-        order_id,
-        order,
-        exc
-    ):
-
-        error = str(
-            exc
-        )
-
+    async def _handle_telegram_exception(self, oid, order, exc):
+        error = str(exc)
         upper = error.upper()
-
-        logger.error(
-            "Telegram Gifts: Telegram RPC error "
-            "order=%s error=%s",
-            order_id,
-            error
-        )
-
-        # ----------------------------------------------------
-        # FLOOD WAIT
-        # ----------------------------------------------------
+        logger.error("Telegram Gifts: Telegram RPC error order=%s error=%s", oid, error)
 
         try:
-
             from telethon import errors
-
-            if isinstance(
-                exc,
-                errors.FloodWaitError
-            ):
-
-                seconds = int(
-                    exc.seconds
-                )
-
-                logger.warning(
-                    "Telegram Gifts: FloodWait %s сек.",
-                    seconds
-                )
-
+            if isinstance(exc, errors.FloodWaitError):
+                seconds = int(exc.seconds)
                 if seconds <= 300:
-
-                    send_funpay_message(
-                        order["chat_id"],
-                        "⏳ Telegram временно ограничил отправку.\n\n"
-                        f"Повторная попытка через {seconds} сек."
-                    )
-
-                    await asyncio.sleep(
-                        seconds
-                    )
-
+                    send_funpay_message(order.get("chat_id"), f"⏳ Telegram временно ограничил отправку.\n\nПовторная попытка через {seconds} сек.")
+                    await asyncio.sleep(seconds)
                     with _orders_lock:
-                        current = _orders.get(
-                            order_id
-                        )
-
-                    if (
-                        current
-                        and current.get("status") == STATUS_SENDING
-                    ):
-
-                        await self._process_job(
-                            {
-                                "order_id": order_id
-                            }
-                        )
-
+                        current = _orders.get(oid)
+                    if current and current.get("status") == STATUS_SENDING:
+                        await self._process_job({"order_id": oid})
                     return
-
-                update_order(
-                    order_id,
-                    status=STATUS_ERROR,
-                    last_error=f"FloodWait {seconds}"
-                )
-
-                send_funpay_message(
-                    order["chat_id"],
-                    "❌ Telegram временно ограничил отправку "
-                    f"подарков на {seconds} сек.\n\n"
-                    "Заказ пока не считается выполненным."
-                )
-
+                update_order(oid, status=STATUS_ERROR, last_error=f"FloodWait {seconds}")
+                send_funpay_message(order.get("chat_id"), f"❌ Telegram временно ограничил отправку подарков на {seconds} сек.\n\nЗаказ пока не считается выполненным.")
                 return
-
         except Exception:
             pass
 
-        # ----------------------------------------------------
-        # BALANCE
-        # ----------------------------------------------------
-
         if (
             "BALANCE_TOO_LOW" in upper
-            or (
-                "BALANCE" in upper
-                and "STAR" in upper
-            )
+            or "STARS_TOO_LOW" in upper
+            or ("BALANCE" in upper and "STAR" in upper)
+            or "NOT_ENOUGH" in upper and "STAR" in upper
         ):
-
-            update_order(
-                order_id,
-                status=STATUS_CONFIRM,
-                last_error=error
-            )
-
-            send_funpay_message(
-                order["chat_id"],
-                "❌ Не удалось отправить подарок.\n\n"
-                "У продавца недостаточно Stars.\n\n"
-                "После пополнения Stars отправьте «+», "
-                "чтобы повторить отправку."
-            )
-
+            update_order(oid, status=STATUS_ERROR, last_error=error)
+            send_funpay_message(order.get("chat_id"), "❌ Не удалось отправить подарок.\n\n⭐ Недостаточно Stars на Telegram-аккаунте продавца.\n\nПополните Stars и отправьте «+», чтобы повторить отправку.")
             return
 
-        # ----------------------------------------------------
-        # GIFT NOT FOUND
-        # ----------------------------------------------------
-
-        if (
-            "STARGIFT_NOT_FOUND" in upper
-            or "STARGIFT_INVALID" in upper
-        ):
-
-            update_order(
-                order_id,
-                status=STATUS_ERROR,
-                last_error=error
-            )
-
-            send_funpay_message(
-                order["chat_id"],
-                "❌ Сейчас этот подарок невозможно отправить.\n\n"
-                "Заказ не считается выполненным."
-            )
-
+        if "STARGIFT_NOT_FOUND" in upper or "STARGIFT_INVALID" in upper:
+            update_order(oid, status=STATUS_ERROR, last_error=error)
+            send_funpay_message(order.get("chat_id"), "❌ Telegram не нашёл указанный подарок.\n\nЗаказ не считается выполненным.")
             return
-
-        # ----------------------------------------------------
-        # USAGE LIMITED
-        # ----------------------------------------------------
 
         if "STARGIFT_USAGE_LIMITED" in upper:
-
-            update_order(
-                order_id,
-                status=STATUS_ERROR,
-                last_error=error
-            )
-
-            send_funpay_message(
-                order["chat_id"],
-                "❌ Этот подарок больше нельзя отправить "
-                "из-за ограничения Telegram.\n\n"
-                "Заказ не считается выполненным."
-            )
-
+            update_order(oid, status=STATUS_ERROR, last_error=error)
+            send_funpay_message(order.get("chat_id"), "❌ Этот подарок сейчас нельзя отправить из-за ограничения Telegram.\n\nЗаказ не считается выполненным.")
             return
 
-        # ----------------------------------------------------
-        # USERNAME
-        # ----------------------------------------------------
-
-        if (
-            "USERNAME_INVALID" in upper
-            or "USERNAME_NOT_OCCUPIED" in upper
-            or "USER_NOT_FOUND" in upper
-            or "PEER_ID_INVALID" in upper
-        ):
-
-            update_order(
-                order_id,
-                status=STATUS_USERNAME,
-                last_error=error
-            )
-
-            send_funpay_message(
-                order["chat_id"],
-                "❌ Telegram не нашёл указанного пользователя.\n\n"
-                "Отправьте другой Telegram username."
-            )
-
+        if any(x in upper for x in ("USERNAME_INVALID", "USERNAME_NOT_OCCUPIED", "USER_NOT_FOUND", "PEER_ID_INVALID")):
+            update_order(oid, status=STATUS_USERNAME, last_error=error)
+            send_funpay_message(order.get("chat_id"), "❌ Telegram не нашёл указанного пользователя.\n\nОтправьте другой Telegram username.")
             return
 
-        # ----------------------------------------------------
-        # FORBIDDEN
-        # ----------------------------------------------------
-
-        if (
-            "CHAT_WRITE_FORBIDDEN" in upper
-            or "USER_IS_BLOCKED" in upper
-            or "USER_RESTRICTED" in upper
-            or "FORBIDDEN" in upper
-        ):
-
-            update_order(
-                order_id,
-                status=STATUS_CONFIRM,
-                last_error=error
-            )
-
-            send_funpay_message(
-                order["chat_id"],
-                "❌ Telegram не разрешил отправить подарок "
-                "этому пользователю.\n\n"
-                "Проверьте получателя."
-            )
-
+        if any(x in upper for x in ("CHAT_WRITE_FORBIDDEN", "USER_IS_BLOCKED", "USER_RESTRICTED")):
+            update_order(oid, status=STATUS_ERROR, last_error=error)
+            send_funpay_message(order.get("chat_id"), "❌ Telegram не разрешил отправить подарок этому пользователю.\n\nОтправьте другой username и затем «+».")
             return
 
-        # ----------------------------------------------------
-        # GENERIC ERROR
-        # ----------------------------------------------------
-
-        update_order(
-            order_id,
-            status=STATUS_ERROR,
-            last_error=error
-        )
-
-        send_funpay_message(
-            order["chat_id"],
-            "❌ Telegram вернул ошибку при отправке подарка.\n\n"
-            "Заказ не считается выполненным.\n"
-            "Продавец проверит ситуацию."
-        )
-
-    # --------------------------------------------------------
-    # ENSURE CLIENT
-    # --------------------------------------------------------
+        update_order(oid, status=STATUS_ERROR, last_error=error)
+        send_funpay_message(order.get("chat_id"), "❌ Telegram вернул ошибку при отправке подарка.\n\nЗаказ не считается выполненным.\nМожно отправить «+» для повторной попытки или !возврат для отмены.")
 
     async def _ensure_client(self):
-
         if not self.telethon_available:
-
             self.telethon_available = ensure_telethon()
-
             if not self.telethon_available:
-
-                raise RuntimeError(
-                    "Telethon не установлен."
-                )
+                raise RuntimeError("Telethon не установлен")
 
         from telethon import TelegramClient
-
         if self.client is None:
-
             self.client = TelegramClient(
                 SESSION_FILE,
                 API_ID,
                 API_HASH,
                 device_model="FunPay Cardinal Telegram Gifts",
                 system_version="Linux",
-                app_version="1.1.0",
+                app_version=VERSION,
                 lang_code="en",
                 system_lang_code="en-US",
             )
-
         if not self.client.is_connected():
-
             await self.client.connect()
-
         if not await self.client.is_user_authorized():
-
             await self._authorize()
 
-    # --------------------------------------------------------
-    # AUTH
-    # --------------------------------------------------------
-
     async def _authorize(self):
-
         if not API_ID or not API_HASH:
-
-            raise RuntimeError(
-                "Не указаны API_ID / API_HASH."
-            )
+            raise RuntimeError("Не указаны API_ID / API_HASH")
 
         from telethon import errors
+        from telethon.tl.functions.auth import SendCodeRequest, SignInRequest, CheckPasswordRequest
+        from telethon.tl.functions.account import GetPasswordRequest
+        from telethon.tl.types import CodeSettings
+        from telethon.password import compute_check
 
-        from telethon.tl.functions.auth import (
-            SendCodeRequest,
-            SignInRequest,
-            CheckPasswordRequest,
-        )
-
-        from telethon.tl.functions.account import (
-            GetPasswordRequest
-        )
-
-        from telethon.tl.types import (
-            CodeSettings
-        )
-
-        from telethon.password import (
-            compute_check
-        )
-
-        print()
-        print("=" * 60)
+        print("\n" + "=" * 60)
         print(" TELEGRAM GIFTS — ПЕРВАЯ АВТОРИЗАЦИЯ")
         print("=" * 60)
-
-        phone = input(
-            "Введи номер Telegram "
-            "(например +79991234567): "
-        ).strip()
-
-        print(
-            "Запрашиваю код Telegram..."
-        )
-
-        result = await self.client(
-            SendCodeRequest(
-                phone_number=phone,
-                api_id=API_ID,
-                api_hash=API_HASH,
-                settings=CodeSettings(
-                    allow_flashcall=False,
-                    current_number=False,
-                    allow_app_hash=False,
-                )
-            )
-        )
-
-        print(
-            "Telegram отправил код через:",
-            type(result.type).__name__
-        )
-
-        if getattr(
-            result,
-            "next_type",
-            None
-        ):
-
-            print(
-                "Следующий способ:",
-                type(result.next_type).__name__
-            )
-
-        if getattr(
-            result,
-            "timeout",
-            None
-        ):
-
-            print(
-                "Таймаут:",
-                result.timeout,
-                "сек."
-            )
-
-        code = input(
-            "Введи код из Telegram: "
-        ).strip()
-
+        phone = input("Введи номер Telegram (например +79991234567): ").strip()
+        result = await self.client(SendCodeRequest(
+            phone_number=phone,
+            api_id=API_ID,
+            api_hash=API_HASH,
+            settings=CodeSettings(allow_flashcall=False, current_number=False, allow_app_hash=False),
+        ))
+        print("Telegram отправил код через:", type(result.type).__name__)
+        code = input("Введи код из Telegram: ").strip()
         try:
-
-            await self.client(
-                SignInRequest(
-                    phone_number=phone,
-                    phone_code_hash=result.phone_code_hash,
-                    phone_code=code
-                )
-            )
-
+            await self.client(SignInRequest(phone_number=phone, phone_code_hash=result.phone_code_hash, phone_code=code))
         except errors.SessionPasswordNeededError:
-
-            password = input(
-                "Введи облачный пароль Telegram (2FA): "
-            ).strip()
-
-            pwd = await self.client(
-                GetPasswordRequest()
-            )
-
-            await self.client(
-                CheckPasswordRequest(
-                    password=compute_check(
-                        pwd,
-                        password
-                    )
-                )
-            )
-
+            password = input("Введи облачный пароль Telegram (2FA): ").strip()
+            pwd = await self.client(GetPasswordRequest())
+            await self.client(CheckPasswordRequest(password=compute_check(pwd, password)))
         me = await self.client.get_me()
-
-        print()
-        print(
-            "Telegram авторизован: "
-            f"{me.first_name} "
-            f"(id={me.id})"
-        )
-        print()
-
-    # --------------------------------------------------------
-    # DISCONNECT
-    # --------------------------------------------------------
+        print(f"Telegram авторизован: {me.first_name or ''} (id={me.id})")
 
     async def _disconnect(self):
-
         if self.client:
-
             try:
-
                 await self.client.disconnect()
-
             except Exception:
                 pass
 
-    # --------------------------------------------------------
-    # SUBMIT
-    # --------------------------------------------------------
-
-    def submit(
-        self,
-        order_id
-    ):
-
-        if (
-            not self.loop
-            or not self.queue
-        ):
-
-            logger.error(
-                "Telegram Gifts: worker ещё не запущен."
-            )
-
+    def submit(self, order_id):
+        if not self.loop or not self.queue:
+            logger.error("Telegram Gifts: worker ещё не запущен")
             return None
+        return asyncio.run_coroutine_threadsafe(self.queue.put({"order_id": str(order_id)}), self.loop)
 
-        return asyncio.run_coroutine_threadsafe(
-            self.queue.put(
-                {
-                    "order_id": str(
-                        order_id
-                    )
-                }
-            ),
-            self.loop
-        )
-
-    # --------------------------------------------------------
-    # STOP
-    # --------------------------------------------------------
+    def run_coro(self, coro):
+        if not self.loop:
+            raise RuntimeError("Worker loop не запущен")
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
     def stop(self):
-
         self.stop_event.set()
-
         if self.loop:
-
             try:
-
-                asyncio.run_coroutine_threadsafe(
-                    self._disconnect(),
-                    self.loop
-                )
-
+                asyncio.run_coroutine_threadsafe(self._disconnect(), self.loop)
             except Exception:
                 pass
+
+    async def get_stars_status(self):
+        await self._ensure_client()
+        from telethon.tl.functions.payments import GetStarsStatusRequest
+        from telethon.tl.types import InputPeerSelf
+        return await self.client(GetStarsStatusRequest(peer=InputPeerSelf()))
+
+    async def account_info(self):
+        await self._ensure_client()
+        me = await self.client.get_me()
+        status = await self.get_stars_status()
+        balance = getattr(status, "balance", None)
+        amount = getattr(balance, "amount", 0) or 0
+        name = " ".join(x for x in (getattr(me, "first_name", None), getattr(me, "last_name", None)) if x) or "—"
+        username = "@" + me.username if getattr(me, "username", None) else "нет username"
+        return (
+            "🎁 <b>Telegram Gifts — аккаунт</b>\n\n"
+            f"👤 Имя: <code>{html.escape(name)}</code>\n"
+            f"🔗 Username: <code>{html.escape(username)}</code>\n"
+            f"🆔 ID: <code>{me.id}</code>\n"
+            f"⭐ Stars: <b>{int(amount)}</b>"
+        )
 
 
 # ============================================================
 # NEW ORDER
 # ============================================================
 
-def bind_to_new_order(
-    c,
-    e
-):
-
+def new_order_handler(c, e):
     try:
-
-        order_id = str(
-            e.order.id
-        )
-
+        oid = str(e.order.id)
         with _orders_lock:
-
-            if order_id in _orders:
+            if oid in _orders:
                 return
 
-        # ----------------------------------------------------
-        # FULL ORDER
-        # ----------------------------------------------------
-
-        try:
-
-            full_order = c.account.get_order(
-                e.order.id
-            )
-
-        except Exception:
-
-            full_order = e.order
-
-        # ----------------------------------------------------
-        # LOT TITLE
-        # ----------------------------------------------------
-
-        lot_title = (
-            getattr(
-                full_order,
-                "title",
-                None
-            )
-            or getattr(
-                full_order,
-                "short_description",
-                None
-            )
-            or getattr(
-                full_order,
-                "description",
-                None
-            )
-            or getattr(
-                e.order,
-                "description",
-                None
-            )
-            or ""
-        )
-
-        lot_title = str(
-            lot_title
-        ).strip()
-
-        gift = find_gift(
-            lot_title
-        )
-
-        if not gift:
-
-            logger.info(
-                "Telegram Gifts: заказ %s не является "
-                "лотом Telegram Gifts: %s",
-                order_id,
-                lot_title
-            )
-
+        order = get_full_order(c, e)
+        resolved = resolve_gift(c, e, order)
+        if not resolved:
+            logger.info("Telegram Gifts: заказ %s не распознан как Telegram Gift", oid)
             return
 
-        gift_id, gift_name = gift
+        gid, name, lot_id, source = resolved
+        chat_id = getattr(e.order, "chat_id", None) or getattr(order, "chat_id", None)
+        buyer = getattr(order, "buyer_username", None) or getattr(e.order, "buyer_username", None) or ""
+        buyer_id = getattr(order, "buyer_id", None) or getattr(e.order, "buyer_id", None)
 
-        # ----------------------------------------------------
-        # CHAT
-        # ----------------------------------------------------
-
-        chat_id = getattr(
-            e.order,
-            "chat_id",
-            None
-        )
-
-        buyer = (
-            getattr(
-                full_order,
-                "buyer_username",
-                None
-            )
-            or getattr(
-                e.order,
-                "buyer_username",
-                None
-            )
-            or ""
-        )
-
-        if not chat_id:
-
+        if not chat_id and buyer:
             try:
-
-                chat = c.account.get_chat_by_name(
-                    buyer
-                )
-
-                if chat:
-                    chat_id = chat.id
-
+                chat = c.account.get_chat_by_name(buyer, True)
+                chat_id = chat.id if chat else None
             except Exception:
+                logger.debug("Telegram Gifts: не удалось получить чат покупателя", exc_info=True)
 
-                logger.exception(
-                    "Telegram Gifts: не удалось определить "
-                    "chat_id заказа %s",
-                    order_id
-                )
-
-        if not chat_id:
-
-            logger.error(
-                "Telegram Gifts: у заказа %s отсутствует chat_id",
-                order_id
-            )
-
+        if chat_id is None:
+            logger.error("Telegram Gifts: у заказа %s отсутствует chat_id", oid)
             return
 
-        # ----------------------------------------------------
-        # SAVE ORDER
-        # ----------------------------------------------------
+        amount = getattr(order, "amount", None) or 1
+        try:
+            amount = max(1, int(amount))
+        except Exception:
+            amount = 1
 
+        record = {
+            "order_id": oid,
+            "gift_id": int(gid),
+            "gift_name": name,
+            "lot_id": lot_id,
+            "gift_source": source,
+            "buyer": buyer,
+            "buyer_id": buyer_id,
+            "chat_id": chat_id,
+            "recipient": None,
+            "status": STATUS_USERNAME,
+            "last_error": None,
+            "amount": amount,
+            "created_at": time.time(),
+        }
         with _orders_lock:
-
-            _orders[order_id] = {
-
-                "order_id": order_id,
-
-                "gift_id": int(
-                    gift_id
-                ),
-
-                "gift_name": gift_name,
-
-                "lot_title": lot_title,
-
-                "buyer": buyer,
-
-                "chat_id": chat_id,
-
-                "recipient": None,
-
-                "status": STATUS_USERNAME,
-
-                "last_error": None,
-
-                "created_at": time.time(),
-            }
-
+            _orders[oid] = record
         save_orders()
-
-        # ----------------------------------------------------
-        # MESSAGE
-        # ----------------------------------------------------
 
         send_funpay_message(
             chat_id,
-            "🎁 Спасибо за покупку!\n\n"
-            "Отправьте ваш Telegram username, "
-            "куда отправить подарок.\n\n"
+            f"🎁 Спасибо за покупку!\n\nПодарок: «{name}»\nКоличество: {amount}\n\n"
+            "Отправьте ваш Telegram username, куда отправить подарок.\n\n"
             "Пример: @username\n\n"
             "❗ Для отмены заказа отправьте: !возврат"
         )
-
-        logger.info(
-            "Telegram Gifts: создан заказ "
-            "order=%s gift=%s id=%s",
-            order_id,
-            gift_name,
-            gift_id
-        )
-
+        logger.info("Telegram Gifts: заказ=%s lot=%s gift=%s source=%s", oid, lot_id, gid, source)
     except Exception:
-
-        logger.exception(
-            "Telegram Gifts: ошибка обработки нового заказа"
-        )
+        logger.exception("Telegram Gifts: ошибка обработки нового заказа")
 
 
 # ============================================================
 # NEW MESSAGE
 # ============================================================
 
-def msg_hook(
-    c,
-    e
-):
-
+def message_handler(c, e):
     try:
-
         msg = e.message
-
-        # ----------------------------------------------------
-        # IGNORE OUR MESSAGE
-        # ----------------------------------------------------
-
-        if msg.author_id == c.account.id:
+        if getattr(msg, "type", None) != MessageTypes.NON_SYSTEM:
             return
 
-        # ----------------------------------------------------
-        # SYSTEM
-        # ----------------------------------------------------
-
-        if msg.type != MessageTypes.NON_SYSTEM:
+        author_id = getattr(msg, "author_id", None)
+        if author_id is not None and str(author_id) == str(c.account.id):
             return
 
-        text = (
-            msg.text
-            or ""
-        ).strip()
-
+        text = clean_text(getattr(msg, "text", None) or "")
         if not text:
             return
 
-        # ----------------------------------------------------
-        # ORDER
-        # ----------------------------------------------------
-
-        order_id, order = find_order_by_chat(
-            msg.chat_id
-        )
-
+        oid, order = find_order_by_message(msg)
         if not order:
             return
 
-        status = order.get(
-            "status"
-        )
+        stored_buyer_id = order.get("buyer_id")
+        if author_id is not None and stored_buyer_id is not None and str(author_id) != str(stored_buyer_id):
+            return
 
-        # ====================================================
-        # USERNAME
-        # ====================================================
+        chat_id = getattr(msg, "chat_id", None) or order.get("chat_id")
+        status = order.get("status")
+
+        # Возврат обрабатывается раньше username/+.
+        if is_refund_command(text):
+            if status in (STATUS_USERNAME, STATUS_CONFIRM, STATUS_ERROR):
+                refund_order(oid)
+            elif status == STATUS_SENDING:
+                send_funpay_message(chat_id, "⏳ Подарок уже отправляется. Дождитесь результата текущей попытки.")
+            elif status == STATUS_DELIVERED:
+                send_funpay_message(chat_id, "ℹ️ Подарок уже был отправлен. Возврат через !возврат после выдачи недоступен.")
+            return
 
         if status == STATUS_USERNAME:
-
-            if text.lower() == "!возврат":
-
-                refund_order(
-                    order_id
-                )
-
-                return
-
-            username = normalize_username(
-                text
-            )
-
+            username = normalize_username(text)
             if not username:
-
-                send_funpay_message(
-                    msg.chat_id,
-                    "❌ Некорректный Telegram username.\n\n"
-                    "Отправьте username в формате:\n"
-                    "@username"
-                )
-
+                send_funpay_message(chat_id, "❌ Некорректный Telegram username.\n\nОтправьте username в формате @username или !возврат.")
                 return
-
-            update_order(
-                order_id,
-                recipient=username,
-                status=STATUS_CONFIRM,
-                last_error=None
-            )
-
-            send_funpay_message(
-                msg.chat_id,
-                "📋 Получатель: "
-                f"{username}\n\n"
-                "Если всё верно — отправьте «+».\n"
-                "Если хотите изменить получателя — "
-                "отправьте новый username.\n\n"
-                "❌ Для возврата: !возврат"
-            )
-
+            update_order(oid, recipient=username, status=STATUS_CONFIRM, last_error=None)
+            send_funpay_message(chat_id, f"📋 Получатель: {username}\n\nЕсли всё верно — отправьте «+».\nЕсли хотите изменить получателя — отправьте новый username.\n\n❌ Для возврата: !возврат")
             return
-
-        # ====================================================
-        # CONFIRM
-        # ====================================================
 
         if status == STATUS_CONFIRM:
-
-            if text.lower() == "!возврат":
-
-                refund_order(
-                    order_id
-                )
-
-                return
-
-            # ------------------------------------------------
-            # CONFIRM
-            # ------------------------------------------------
-
-            if text == "+":
-
-                update_order(
-                    order_id,
-                    status=STATUS_SENDING,
-                    last_error=None
-                )
-
-                send_funpay_message(
-                    msg.chat_id,
-                    "⏳ Отправляю подарок...\n\n"
-                    "Пожалуйста, подождите."
-                )
-
+            if is_plus(text):
+                if not order.get("recipient"):
+                    update_order(oid, status=STATUS_USERNAME)
+                    send_funpay_message(chat_id, "❌ Сначала отправьте Telegram username.")
+                    return
+                update_order(oid, status=STATUS_SENDING, last_error=None)
+                send_funpay_message(chat_id, "⏳ Отправляю подарок...\n\nПожалуйста, подождите.")
                 if _worker:
-
-                    _worker.submit(
-                        order_id
-                    )
-
+                    _worker.submit(oid)
                 else:
-
-                    update_order(
-                        order_id,
-                        status=STATUS_ERROR,
-                        last_error="Worker unavailable"
-                    )
-
-                    send_funpay_message(
-                        msg.chat_id,
-                        "❌ Telegram worker не запущен.\n\n"
-                        "Подарок не отправлен."
-                    )
-
+                    update_order(oid, status=STATUS_ERROR, last_error="Worker unavailable")
+                    send_funpay_message(chat_id, "❌ Telegram worker не запущен.\n\nПодарок не отправлен.")
                 return
 
-            # ------------------------------------------------
-            # CHANGE USERNAME
-            # ------------------------------------------------
-
-            username = normalize_username(
-                text
-            )
-
+            username = normalize_username(text)
             if username:
-
-                update_order(
-                    order_id,
-                    recipient=username,
-                    status=STATUS_CONFIRM,
-                    last_error=None
-                )
-
-                send_funpay_message(
-                    msg.chat_id,
-                    "📋 Получатель изменён:\n"
-                    f"{username}\n\n"
-                    "Если всё верно — отправьте «+».\n"
-                    "Для изменения отправьте новый username.\n"
-                    "Для возврата: !возврат"
-                )
-
+                update_order(oid, recipient=username, status=STATUS_CONFIRM, last_error=None)
+                send_funpay_message(chat_id, f"📋 Получатель изменён: {username}\n\nЕсли всё верно — отправьте «+».\nДля возврата: !возврат")
                 return
 
-            send_funpay_message(
-                msg.chat_id,
-                "❓ Не понял сообщение.\n\n"
-                "Отправьте «+» для подтверждения,\n"
-                "новый @username для изменения получателя\n"
-                "или !возврат для отмены."
-            )
-
+            send_funpay_message(chat_id, "❓ Не понял сообщение.\n\nОтправьте «+», новый @username или !возврат.")
             return
-
-        # ====================================================
-        # SENDING
-        # ====================================================
 
         if status == STATUS_SENDING:
-
-            send_funpay_message(
-                msg.chat_id,
-                "⏳ Подарок уже отправляется.\n"
-                "Пожалуйста, подождите."
-            )
-
+            send_funpay_message(chat_id, "⏳ Подарок уже отправляется.\nПожалуйста, подождите.")
             return
-
-        # ====================================================
-        # ERROR
-        # ====================================================
 
         if status == STATUS_ERROR:
-
-            if text.lower() == "!возврат":
-
-                refund_order(
-                    order_id
-                )
-
-                return
-
-            if (
-                text == "+"
-                and order.get("recipient")
-            ):
-
-                update_order(
-                    order_id,
-                    status=STATUS_SENDING,
-                    last_error=None
-                )
-
-                send_funpay_message(
-                    msg.chat_id,
-                    "⏳ Повторяю отправку подарка..."
-                )
-
+            if is_plus(text) and order.get("recipient"):
+                update_order(oid, status=STATUS_SENDING, last_error=None)
+                send_funpay_message(chat_id, "⏳ Повторяю отправку подарка...")
                 if _worker:
-
-                    _worker.submit(
-                        order_id
-                    )
-
+                    _worker.submit(oid)
                 return
-
-            username = normalize_username(
-                text
-            )
-
+            username = normalize_username(text)
             if username:
-
-                update_order(
-                    order_id,
-                    recipient=username,
-                    status=STATUS_CONFIRM,
-                    last_error=None
-                )
-
-                send_funpay_message(
-                    msg.chat_id,
-                    "📋 Новый получатель:\n"
-                    f"{username}\n\n"
-                    "Если всё верно — отправьте «+»."
-                )
-
+                update_order(oid, recipient=username, status=STATUS_CONFIRM, last_error=None)
+                send_funpay_message(chat_id, f"📋 Новый получатель: {username}\n\nОтправьте «+» для подтверждения.")
                 return
-
-        # ====================================================
-        # DELIVERED
-        # ====================================================
-
-        if status == STATUS_DELIVERED:
-            return
-
-        # ====================================================
-        # REFUNDED
-        # ====================================================
-
-        if status == STATUS_REFUNDED:
-            return
-
+            send_funpay_message(chat_id, "❓ Заказ ожидает повторной попытки. Отправьте «+», новый @username или !возврат.")
     except Exception:
-
-        logger.exception(
-            "Telegram Gifts: ошибка обработки сообщения"
-        )
+        logger.exception("Telegram Gifts: ошибка обработки сообщения")
 
 
 # ============================================================
-# POST INIT
+# TELEGRAM COMMANDS
 # ============================================================
 
-def post_init(
-    c
-):
+def register_commands(c):
+    if not getattr(c, "telegram", None):
+        logger.warning("Telegram Gifts: Telegram-панель Cardinal отключена, команды не зарегистрированы")
+        return
 
-    global _cardinal
-    global _worker
+    commands = [
+        ("gift_account", "Telegram-аккаунт и баланс Stars", True),
+        ("gift_lots", "Привязанные лоты", True),
+        ("gift_bind", "Привязать лот: /gift_bind LOT_ID GIFT_ID", False),
+        ("gift_unbind", "Отвязать лот: /gift_unbind LOT_ID", False),
+    ]
+    try:
+        c.add_telegram_commands(UUID, commands)
+    except Exception:
+        logger.exception("Telegram Gifts: не удалось добавить команды в меню Cardinal")
+        return
 
+    tg = c.telegram
+    bot = tg.bot
+
+    def authorized(message):
+        try:
+            return message.from_user.id in tg.authorized_users
+        except Exception:
+            return False
+
+    def account_command(message):
+        if not authorized(message) or not _worker:
+            return
+        try:
+            future = _worker.run_coro(_worker.account_info())
+            text = future.result(timeout=60)
+            bot.send_message(message.chat.id, text, parse_mode="HTML")
+        except Exception as exc:
+            logger.exception("Telegram Gifts: /gift_account")
+            bot.send_message(message.chat.id, f"❌ Ошибка: <code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+
+    def lots_command(message):
+        if not authorized(message):
+            return
+        with _orders_lock:
+            bindings = dict(_lot_bindings)
+        if not bindings:
+            bot.send_message(message.chat.id, "📦 Привязанных лотов нет.")
+            return
+        lines = ["📦 <b>Привязанные лоты</b>", ""]
+        for lot_id, binding in sorted(bindings.items(), key=lambda x: str(x[0])):
+            gid = binding.get("gift_id")
+            name = binding.get("gift_name") or gift_name(gid)
+            lines.append(f"• <code>{html.escape(str(lot_id))}</code> → «{html.escape(str(name))}» (<code>{gid}</code>)")
+        bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
+
+    def bind_command(message):
+        if not authorized(message):
+            return
+        parts = clean_text(message.text).split()
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+            bot.send_message(message.chat.id, "Использование: <code>/gift_bind LOT_ID GIFT_ID</code>", parse_mode="HTML")
+            return
+        lot_id = str(int(parts[1]))
+        gid = int(parts[2])
+        if gid not in GIFTS:
+            bot.send_message(message.chat.id, "❌ Неизвестный gift_id. Проверьте ID подарка в конфигурации плагина.")
+            return
+        with _orders_lock:
+            _lot_bindings[lot_id] = {"gift_id": gid, "gift_name": GIFTS[gid], "updated_at": time.time()}
+        save_bindings()
+        bot.send_message(message.chat.id, f"✅ Лот <code>{lot_id}</code> привязан к подарку «{html.escape(GIFTS[gid])}» (<code>{gid}</code>).", parse_mode="HTML")
+        logger.info("Telegram Gifts: привязка lot=%s -> gift=%s", lot_id, gid)
+
+    def unbind_command(message):
+        if not authorized(message):
+            return
+        parts = clean_text(message.text).split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            bot.send_message(message.chat.id, "Использование: <code>/gift_unbind LOT_ID</code>", parse_mode="HTML")
+            return
+        lot_id = str(int(parts[1]))
+        with _orders_lock:
+            existed = _lot_bindings.pop(lot_id, None)
+        save_bindings()
+        bot.send_message(message.chat.id, "✅ Лот отвязан." if existed else "ℹ️ Такой привязки не было.")
+        logger.info("Telegram Gifts: отвязка lot=%s", lot_id)
+
+    tg.msg_handler(account_command, commands=["gift_account"])
+    tg.msg_handler(lots_command, commands=["gift_lots"])
+    tg.msg_handler(bind_command, commands=["gift_bind"])
+    tg.msg_handler(unbind_command, commands=["gift_unbind"])
+
+
+# ============================================================
+# LIFECYCLE
+# ============================================================
+
+def post_init(c):
+    global _cardinal, _worker
     _cardinal = c
+    logger.info("Telegram Gifts: инициализация...")
+    load_state()
 
-    logger.info(
-        "Telegram Gifts: инициализация..."
-    )
+    if importlib.util.find_spec("telethon") is None:
+        logger.warning("Telegram Gifts: Telethon не установлен. Он будет установлен автоматически при первом обращении к Telegram.")
 
-    load_orders()
-
-    # --------------------------------------------------------
-    # Проверяем зависимость, но НЕ импортируем Telethon
-    # на этапе загрузки самого plugin.py.
-    # --------------------------------------------------------
-
-    if importlib.util.find_spec(
-        "telethon"
-    ) is None:
-
-        logger.warning(
-            "Telegram Gifts: Telethon не установлен. "
-            "Он будет установлен автоматически при первом "
-            "запуске Telegram worker."
-        )
-
-    # --------------------------------------------------------
-    # WORKER
-    # --------------------------------------------------------
-
-    if not _worker:
-
-        _worker = TelegramGiftWorker(
-            c
-        )
-
+    if _worker is None:
+        _worker = TelegramGiftWorker(c)
         _worker.start()
+        logger.info("Telegram Gifts: worker запущен")
 
-        logger.info(
-            "Telegram Gifts: worker запущен."
-        )
-
-    logger.info(
-        "Telegram Gifts: плагин успешно загружен."
-    )
+    register_commands(c)
+    logger.info("Telegram Gifts: плагин успешно загружен v%s", VERSION)
 
 
-# ============================================================
-# POST STOP
-# ============================================================
-
-def post_stop(
-    c
-):
-
+def post_stop(c):
     global _worker
-
     if _worker:
-
         _worker.stop()
-
         _worker = None
-
-    logger.info(
-        "Telegram Gifts: worker остановлен."
-    )
+    logger.info("Telegram Gifts: worker остановлен")
 
 
 # ============================================================
 # CARDINAL BINDS
 # ============================================================
 
-BIND_TO_POST_INIT = [
-    post_init
-]
-
-BIND_TO_NEW_ORDER = [
-    bind_to_new_order
-]
-
-BIND_TO_NEW_MESSAGE = [
-    msg_hook
-]
-
-BIND_TO_POST_STOP = [
-    post_stop
-]
-
+BIND_TO_POST_INIT = [post_init]
+BIND_TO_NEW_ORDER = [new_order_handler]
+BIND_TO_NEW_MESSAGE = [message_handler]
+BIND_TO_POST_STOP = [post_stop]
 BIND_TO_DELETE = None
-
-# === COMPLETE FIXES ===
-import html, unicodedata
-LOT_BINDINGS_FILE=os.path.join(PLUGIN_DIR,'lot_bindings.json')
-try:
-    with open(LOT_BINDINGS_FILE,'r',encoding='utf-8') as f: LOT_BINDINGS=json.load(f)
-except Exception: LOT_BINDINGS={}
-
-def _clean(x): return unicodedata.normalize('NFKC',str(x or '')).replace('\u200b','').replace('\u200c','').replace('\u200d','').replace('\ufeff','').strip()
-def _refund(x): return _clean(x).casefold().replace(' ','')=='!возврат'
-def _plus(x): return _clean(x) in ('+','＋')
-def _gid(x):
-    m=re.search(r'(?i)\bID\s*:\s*(\d{10,25})\b',str(x or '')); return int(m.group(1)) if m else None
-def _lid(c,o):
-    for a in ('lot_id','offer_id'):
-        v=getattr(o,a,None)
-        if v is not None:return str(v)
-    try:
-        sub=getattr(o,'subcategory',None); lots=c.profile.get_sorted_lots(2).get(sub,{}) if sub else {}
-        text=str(getattr(o,'description','') or ''); best=None; n=-1
-        for l in lots.values():
-            q=', '.join(str(x) for x in (getattr(l,'server',None),getattr(l,'side',None),getattr(l,'description',None)) if x)
-            if q and q in text and len(q)>n:best,n=l,len(q)
-        return str(best.id) if best else None
-    except Exception:return None
-def _resolve(c,e,o):
-    for text in (getattr(o,'full_description',None),getattr(o,'description',None),getattr(o,'short_description',None),getattr(e.order,'description',None)):
-        gid=_gid(text)
-        if gid is not None:return gid,GIFTS.get(gid,'Подарок %s'%gid),_lid(c,o)
-    lid=_lid(c,o); b=LOT_BINDINGS.get(str(lid)) if lid else None
-    if b:
-        gid=int(b['gift_id']);return gid,GIFTS.get(gid,b.get('gift_name','Подарок %s'%gid)),lid
-    g=find_gift(getattr(o,'short_description',None) or getattr(o,'title',None) or getattr(o,'description',None) or '')
-    return (g[0],g[1],lid) if g else None
-def _save_bind():
-    os.makedirs(PLUGIN_DIR,exist_ok=True); tmp=LOT_BINDINGS_FILE+'.tmp'
-    with open(tmp,'w',encoding='utf-8') as f:json.dump(LOT_BINDINGS,f,ensure_ascii=False,indent=4)
-    os.replace(tmp,LOT_BINDINGS_FILE)
-def _new(c,e):
-    try:
-        oid=str(e.order.id)
-        if oid in _orders:return
-        o=c.account.get_order(e.order.id); r=_resolve(c,e,o)
-        if not r:return
-        gid,name,lid=r; chat=getattr(e.order,'chat_id',None) or getattr(o,'chat_id',None); buyer=getattr(o,'buyer_username',None) or getattr(e.order,'buyer_username',None) or ''
-        if not chat and buyer:
-            try:q=c.account.get_chat_by_name(buyer); chat=q.id if q else None
-            except Exception:pass
-        if not chat:return
-        with _orders_lock:_orders[oid]={'order_id':oid,'gift_id':gid,'gift_name':name,'lot_id':lid,'buyer':buyer,'buyer_id':getattr(o,'buyer_id',None),'chat_id':chat,'recipient':None,'status':STATUS_USERNAME,'last_error':None,'amount':max(1,int(getattr(o,'amount',1) or 1)),'created_at':time.time()}
-        save_orders();send_funpay_message(chat,'🎁 Спасибо за покупку!\n\nПодарок: «%s»\nКоличество: %s\n\nОтправьте ваш Telegram username, куда отправить подарок.\n\nПример: @username\n\n❗ Для отмены заказа отправьте: !возврат'%(name,_orders[oid]['amount']))
-    except Exception:logger.exception('Telegram Gifts: fixed new order')
-def _find(m):
-    oid,o=find_order_by_chat(getattr(m,'chat_id',None))
-    if o:return oid,o
-    a=str(getattr(m,'author','') or '').lstrip('@').casefold()
-    with _orders_lock:
-        for i,v in _orders.items():
-            if v.get('status') in (STATUS_USERNAME,STATUS_CONFIRM,STATUS_SENDING,STATUS_ERROR) and a and str(v.get('buyer','')).lstrip('@').casefold()==a:return i,v
-    return None,None
-def _msg(c,e):
-    try:
-        m=e.message;t=_clean(getattr(m,'text','') or ''); oid,o=_find(m)
-        if not t or not o:return
-        aid=getattr(m,'author_id',None)
-        if aid is not None and str(aid)==str(c.account.id):return
-        if aid is not None and o.get('buyer_id') is not None and str(aid)!=str(o['buyer_id']):return
-        cid=getattr(m,'chat_id',None) or o['chat_id']; st=o['status']
-        if _refund(t):
-            if st in (STATUS_USERNAME,STATUS_CONFIRM,STATUS_ERROR):refund_order(oid)
-            else:send_funpay_message(cid,'⏳ Подарок уже отправляется. Дождитесь результата текущей попытки.')
-            return
-        if st==STATUS_USERNAME:
-            u=normalize_username(t)
-            if not u:send_funpay_message(cid,'❌ Некорректный username. Отправьте @username или !возврат');return
-            update_order(oid,recipient=u,status=STATUS_CONFIRM,last_error=None);send_funpay_message(cid,'📋 Получатель: %s\n\nЕсли всё верно — отправьте «+».\nДля изменения отправьте новый username.\nДля возврата: !возврат'%u);return
-        if st==STATUS_CONFIRM and _plus(t):
-            update_order(oid,status=STATUS_SENDING,last_error=None);send_funpay_message(cid,'⏳ Отправляю подарок...')
-            if _worker:_worker.submit(oid)
-            return
-        if st==STATUS_CONFIRM:
-            u=normalize_username(t)
-            if u:update_order(oid,recipient=u,status=STATUS_CONFIRM,last_error=None);send_funpay_message(cid,'📋 Получатель изменён: %s\n\nОтправьте «+». '%u);return
-        if st==STATUS_ERROR and _plus(t) and o.get('recipient'):
-            update_order(oid,status=STATUS_SENDING,last_error=None);send_funpay_message(cid,'⏳ Повторяю отправку подарка...')
-            if _worker:_worker.submit(oid)
-    except Exception:logger.exception('Telegram Gifts: fixed message')
-async def _stars(self):
-    from telethon.tl.functions.payments import GetStarsStatusRequest
-    from telethon.tl.types import InputPeerSelf
-    return await self.client(GetStarsStatusRequest(peer=InputPeerSelf()))
-async def _info(self):
-    await self._ensure_client();me=await self.client.get_me();s=await self._stars();b=getattr(getattr(s,'balance',None),'amount',0) or 0
-    n=' '.join(x for x in (getattr(me,'first_name',None),getattr(me,'last_name',None)) if x) or '—';u='@'+me.username if getattr(me,'username',None) else 'нет username'
-    return '🎁 <b>Telegram Gifts — аккаунт</b>\n\n👤 Имя: <code>%s</code>\n🔗 Username: <code>%s</code>\n🆔 ID: <code>%s</code>\n⭐ Stars: <b>%s</b>'%(html.escape(n),html.escape(u),me.id,int(b))
-def _commands(c):
-    if not getattr(c,'telegram',None):return
-    tg=c.telegram
-    c.add_telegram_commands(UUID,[('gift_account','Telegram-аккаунт и баланс Stars',True),('gift_lots','Привязанные лоты',True),('gift_bind','Привязать: /gift_bind LOT_ID GIFT_ID',False),('gift_unbind','Отвязать: /gift_unbind LOT_ID',False)])
-    def ok(m):
-        try:return m.from_user.id in tg.authorized_users
-        except:return False
-    def account(m):
-        if not ok(m) or not _worker:return
-        try:tg.bot.send_message(m.chat.id,_worker.run_coro(_worker.info()).result(timeout=45))
-        except Exception as ex:tg.bot.send_message(m.chat.id,'❌ Ошибка: <code>%s</code>'%html.escape(str(ex)))
-    def lots(m):
-        if not ok(m):return
-        if not LOT_BINDINGS:tg.bot.send_message(m.chat.id,'📦 Привязанных лотов нет.');return
-        tg.bot.send_message(m.chat.id,'📦 <b>Привязанные лоты</b>\n\n'+'\n'.join('• <code>%s</code> → «%s» (<code>%s</code>)'%(k,html.escape(str(v.get('gift_name') or GIFTS.get(int(v['gift_id']),v['gift_id']))),v.get('gift_id')) for k,v in sorted(LOT_BINDINGS.items())))
-    def bind(m):
-        if not ok(m):return
-        x=_clean(m.text).split()
-        if len(x)!=3 or not x[1].isdigit() or not x[2].isdigit():tg.bot.send_message(m.chat.id,'Использование: <code>/gift_bind LOT_ID GIFT_ID</code>');return
-        gid=int(x[2])
-        if gid not in GIFTS:tg.bot.send_message(m.chat.id,'❌ Неизвестный gift_id.');return
-        LOT_BINDINGS[x[1]]={'gift_id':gid,'gift_name':GIFTS[gid]};_save_bind();tg.bot.send_message(m.chat.id,'✅ Лот привязан.')
-    def unbind(m):
-        if not ok(m):return
-        x=_clean(m.text).split()
-        if len(x)!=2 or not x[1].isdigit():tg.bot.send_message(m.chat.id,'Использование: <code>/gift_unbind LOT_ID</code>');return
-        old=LOT_BINDINGS.pop(x[1],None);_save_bind();tg.bot.send_message(m.chat.id,'✅ Лот отвязан.' if old else 'ℹ️ Привязка не найдена.')
-    tg.msg_handler(account,commands=['gift_account']);tg.msg_handler(lots,commands=['gift_lots']);tg.msg_handler(bind,commands=['gift_bind']);tg.msg_handler(unbind,commands=['gift_unbind'])
-TelegramGiftWorker.run_coro=lambda self,coro: asyncio.run_coroutine_threadsafe(coro,self.loop)
-TelegramGiftWorker.stars=stars_fixed if 'stars_fixed' in globals() else _stars
-TelegramGiftWorker.info=_info
-_old_init=post_init
-def post_init_fixed(c): _old_init(c);_commands(c)
-BIND_TO_POST_INIT=[post_init_fixed]
-BIND_TO_NEW_ORDER=[_new]
-BIND_TO_NEW_MESSAGE=[_msg]
-VERSION='2.0.1'
